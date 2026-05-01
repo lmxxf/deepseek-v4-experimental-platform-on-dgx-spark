@@ -58,8 +58,10 @@ def main():
 
     print(f"[rank {rank}] After init_process_group: {meminfo()}", flush=True)
 
+    is_main = (rank == 0)
     def log(msg):
-        print(f"[rank {rank}] {msg} | {meminfo()}", flush=True)
+        if is_main:
+            print(f"[rank {rank}] {msg} | {meminfo()}", flush=True)
 
     torch.cuda.set_device(local_rank)
     torch.set_default_dtype(torch.bfloat16)
@@ -112,22 +114,47 @@ def main():
 
     if world_size > 1:
         dist.barrier()
-    log("All ranks ready. Running forward pass...")
 
-    input_ids = torch.tensor([[1, 2, 3, 4, 5]], dtype=torch.long, device="cuda")
+    # Load tokenizer and encoding
+    from transformers import PreTrainedTokenizerFast
+    tokenizer = PreTrainedTokenizerFast(tokenizer_file=os.path.join(hf_ckpt_path, "tokenizer.json"))
+
+    encoding_dir = os.path.join(hf_ckpt_path, "encoding")
+    sys.path.insert(0, encoding_dir)
+    from encoding_dsv4 import encode_messages
+    log("Tokenizer loaded, starting generation...")
+
+    prompt = "你好，请用一句话介绍你自己。"
+    messages = [{"role": "user", "content": prompt}]
+    formatted = encode_messages(messages, thinking_mode="chat")
+    input_ids = torch.tensor([tokenizer.encode(formatted)], dtype=torch.long, device="cuda")
+    log(f"Prompt: '{prompt}' → {input_ids.shape[1]} tokens")
+
+    max_new_tokens = 50
     t4 = time.time()
     with torch.inference_mode():
         try:
-            logits = model.forward(input_ids, 0)
+            # Simple autoregressive generation
+            generated = input_ids.clone()
+            prev_pos = 0
+            for step in range(max_new_tokens):
+                logits = model.forward(generated[:, prev_pos:], prev_pos)
+                next_token = logits.argmax(dim=-1, keepdim=True).to(torch.long)
+                generated = torch.cat([generated, next_token], dim=-1)
+                prev_pos = generated.shape[1] - 1
+                eos_id = tokenizer.encode("<｜end▁of▁sentence｜>")[0] if tokenizer.eos_token_id is None else tokenizer.eos_token_id
+                if next_token.item() == eos_id:
+                    break
+                if is_main and (step + 1) % 10 == 0:
+                    print(f"  step {step+1}/{max_new_tokens}...", flush=True)
+
             t5 = time.time()
-            log(f"Forward pass OK! {t5-t4:.1f}s")
-            log(f"Logits shape: {logits.shape}, dtype: {logits.dtype}")
-            log(f"Logits range: [{logits.min().item():.4f}, {logits.max().item():.4f}]")
-            top5 = logits[0].topk(5) if logits.dim() == 2 else logits.topk(5)
-            log(f"Top 5 token IDs: {top5.indices.tolist()}")
+            output_text = tokenizer.decode(generated[0].tolist(), skip_special_tokens=True)
+            log(f"Generation OK! {t5-t4:.1f}s, {generated.shape[1] - input_ids.shape[1]} new tokens")
+            log(f"Output: {output_text}")
         except Exception as e:
             t5 = time.time()
-            log(f"Forward pass FAILED after {t5-t4:.1f}s")
+            log(f"Generation FAILED after {t5-t4:.1f}s")
             import traceback
             traceback.print_exc()
 
