@@ -205,6 +205,137 @@ python convert.py \
 
 ---
 
+## 第五阶段：kernel_sm121.py 实现与验证（2026-05-01）
+
+### 实现
+
+`kernel_sm121.py`（约 230 行）：纯 PyTorch 实现，替换 TileLang 版 `kernel.py`。
+
+| 函数 | 实现方式 | 关键细节 |
+|------|---------|---------|
+| `act_quant` | 逐块 absmax→scale→clamp→cast | 支持 inplace 模式、E8M0 scale、power-of-2 rounding |
+| `fp4_act_quant` | FP4_TABLE 最近值查找模拟 | 只实现 inplace（model.py 只用 inplace） |
+| `fp8_gemm` | dequant→BF16→`torch.mm` | per-block scale 逐块还原后做 matmul |
+| `fp4_gemm` | int8 视图 + FP4_TABLE 手动解包→BF16→matmul | `to(float32)` 不可用，必须手动查表 |
+| `sparse_attn` | for 循环 + bmm + softmax + attn_sink | 慢（Python 循环），但正确 |
+| `hc_split_sinkhorn` | sigmoid + softmax + Sinkhorn 迭代 | 20 次迭代归一化 |
+
+### FP4 解包的坑
+
+- `float4_e2m1fn_x2.to(float32)` 在 CPU 和 GPU 上都不支持（`copy_kernel not implemented`）
+- GPU 上 `to()` 还会触发 CUDA device-side assert（`DynamicCast.h` assertion failed）
+- 解法：`view(uint8)` → 位操作拆 low/high nibble → `FP4_TABLE[idx]` 查表
+- convert.py 里也是同样方法（`FP4_TABLE` lookup）
+
+### 单元测试结果
+
+在 `vllm-node-sm120` 容器（PyTorch 2.11.0, GB10 sm_121）全部 6 个 kernel 通过 ✅
+
+```
+act_quant (normal)     ✅
+act_quant (inplace)    ✅
+act_quant (E8M0 scale) ✅
+fp4_act_quant (inplace)✅
+fp8_gemm               ✅
+fp4_gemm               ✅
+sparse_attn            ✅
+hc_split_sinkhorn      ✅
+```
+
+---
+
+## 第六阶段：双机 forward pass 验证（2026-05-01）
+
+### ✅ 首次 forward pass 成功！（2026-05-01 13:49 UTC+8）
+
+```
+Forward pass OK! 5.8s
+Logits shape: [1, 129280], dtype: float32
+Logits range: [-29.9483, 19.7920]
+GPU memory: 81.8GB per node
+```
+
+DeepSeek V4 Flash 280B，双机 TP=2，纯 PyTorch kernel（kernel_sm121.py），DGX Spark sm_121 上跑通。
+
+### 踩过的坑
+
+**方案调研阶段**
+
+| # | 坑 | 原因 | 解法 |
+|---|---|------|------|
+| 1 | TileLang 0.1.8 不支持 sm_121 | sm_120 整个系列是消费级，没有多卡市场 | 写 kernel_sm121.py 纯 PyTorch fallback |
+| 2 | 以为 FP8 路径能绕开 FP4 | FP8 权重 ~300GB > 256GB 统一内存 | FP4 是唯一选项，6 个 kernel 全替换 |
+| 3 | `float4_e2m1fn_x2.to(float32)` 不可用 | PyTorch 未实现 FP4 cast（CPU/GPU 都不行） | int8 视图 + FP4_TABLE 手动查表解包 |
+
+**权重转换与加载阶段**
+
+| # | 坑 | 原因 | 解法 |
+|---|---|------|------|
+| 4 | convert.py 输出 77GB 单文件 → mmap OOM | 统一内存下 mmap 活跃页 + GPU 分配竞争同一个 128GB 池 | 跳过 convert.py，直接读 HF 46 shard（vLLM 方案） |
+| 5 | `load_model()` 默认 CPU 加载 → OOM | safetensors 先全量加载到 CPU RAM，统一内存被双倍占用 | 流式加载，每个 shard 独立打开/关闭 |
+| 6 | `safe_open(device="cuda")` 单文件 → 仍 OOM | mmap 77GB 文件的活跃页持续占用物理内存 | 46 小 shard 逐个处理，峰值 mmap 仅 3.5GB |
+| 7 | `state_dict` 字典攒所有 tensor → OOM | 77GB 权重 + 骨架同时在内存 | 改为逐 tensor `setattr` 后立即释放 |
+
+**单机测试阶段**
+
+| # | 坑 | 原因 | 解法 |
+|---|---|------|------|
+| 8 | 单机创建骨架 OOM（死机重启 😂） | TP=2 模型骨架 256 专家全分配 > 128GB | 必须双机，world_size=2 只创建 128 专家 |
+
+**双机通信阶段**
+
+| # | 坑 | 原因 | 解法 |
+|---|---|------|------|
+| 9 | NCCL `init_process_group` 超时 15 分钟 | `NCCL_SOCKET_IFNAME=eth1` 写错 | 改为 `enp1s0f1np1`，对齐 eugr 配置 |
+| 10 | 还缺 `NCCL_IB_HCA`、`GLOO_SOCKET_IFNAME` | RoCE 设备名和 Gloo 接口都要配 | 从 eugr launch-cluster.sh 抄完整配置 |
+| 11 | slave 报 `No such file: test_dual_node.py` | `-v $WORKSPACE:/workspace` 挂载的是 slave 本地目录，没有脚本 | rsync 同步脚本到 slave，启动前自动同步 |
+
+**meta tensor 地狱（6 轮迭代）**
+
+| # | 坑 | 原因 | 解法 |
+|---|---|------|------|
+| 12 | `weight.scale` 属性丢失 | `setattr` 替换 Parameter 后 `.scale` 链接断开 | 加载后遍历 Linear 重新挂 `weight.scale = module.scale` |
+| 13 | `freqs_cis` 在 meta 上 | `with torch.device("meta")` 创建骨架，buffer 停在 meta | 尝试 `_fix_meta_tensors` 重算 |
+| 14 | `named_buffers()` 漏层 | meta 设备上多层共享同一个 tensor 对象，去重后只返回第一次出现 | 直接操作 `module._buffers` 字典 |
+| 15 | `_buffers` 直接操作仍漏层 | 仍然有去重问题 | **放弃 meta 方案，改回 `with torch.device("cuda")` 创建骨架** |
+| 16 | `precompute_freqs_cis` 在 CPU 上算出 meta tensor | 函数内部从输入继承 device | 不再需要——CUDA 骨架直接算好 |
+
+**forward pass 阶段**
+
+| # | 坑 | 原因 | 解法 |
+|---|---|------|------|
+| 17 | `fast_hadamard_transform` 编译失败 | CUDA kernel 不支持 sm_121 | 纯 PyTorch fallback（Hadamard 矩阵乘法，32 行） |
+| 18 | `F.linear` dtype mismatch（Compressor 内） | model.py 内部 float32 输入 + BF16 权重 | monkey-patch `model.linear()` 加 dtype cast |
+| 19 | `torch.arange` 在 CPU 上 | 缺少 `torch.set_default_device("cuda")` | 权重加载后加上 |
+| 20 | `F.linear` dtype mismatch（get_logits） | `x.float()` + BF16 `self.weight` | monkey-patch `ParallelHead.get_logits()` |
+| 21 | `ParallelHead` 类名写成 `Head` | 没看清 model.py 的类名 | 改正 |
+
+### 关键认知：统一内存加载策略
+
+DGX Spark 的 128GB 统一内存（CPU+GPU 共享）决定了权重加载必须用流式方案：
+- ❌ `load_model(file)` 一次性加载 → CPU 中转 + GPU 分配 = 双倍占用 → OOM
+- ❌ `safe_open(device="cuda")` 单个 77GB 文件 → mmap 活跃页 + GPU 分配竞争 → OOM
+- ✅ **46 个 HF shard 逐个打开/加载/关闭** → 峰值 mmap 3.5GB + GPU 渐增 → OK
+
+这就是 vLLM 的方案——不是偶然，是统一内存架构的唯一正解。
+
+### 当前文件清单
+
+| 文件 | 功能 | 行数 |
+|------|------|------|
+| `kernel_sm121.py` | 6 个 TileLang kernel 的纯 PyTorch fallback | ~230 |
+| `weight_loader.py` | HF shard 流式加载 + key 映射 + TP 分片 | ~270 |
+| `fast_hadamard_transform.py` | Hadamard 变换纯 PyTorch fallback | ~30 |
+| `test_dual_node.py` | 双机测试脚本 | ~130 |
+| `run_dual_node.sh` | 双机启动脚本 | ~60 |
+
+### 下一步
+
+Step 5: Hook 框架——在 model.py 的 Block.forward() 里插 hook 提取激活值
+Step 6: 第一个实验——开灯/关灯对比
+
+---
+
 ## 插曲：跨领域因果桥接盲区（2026-05-01）
 
 做方案调研时发现的认知缺陷，和 C.C. 交叉验证后记录。
