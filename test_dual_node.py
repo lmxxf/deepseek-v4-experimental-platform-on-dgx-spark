@@ -130,33 +130,59 @@ def main():
     input_ids = torch.tensor([tokenizer.encode(formatted)], dtype=torch.long, device="cuda")
     log(f"Prompt: '{prompt}' → {input_ids.shape[1]} tokens")
 
-    max_new_tokens = 50
+    # === Hook: capture residual stream at 2/3 position (layer 28-29 of 43) ===
+    target_layers = [28, 29]
+    captured = {}
+
+    def make_hook(layer_id):
+        def hook_fn(module, input, output):
+            # input[0] = x, shape [batch, seq, hc_mult, dim] = [1, seq, 4, 4096]
+            x = input[0]
+            captured[layer_id] = x.detach().cpu().clone()
+        return hook_fn
+
+    hooks = []
+    for lid in target_layers:
+        h = model.layers[lid].register_forward_hook(make_hook(lid))
+        hooks.append(h)
+    log(f"Hooks registered on layers {target_layers}")
+
+    # === Prefill: single forward pass to get activations ===
     t4 = time.time()
     with torch.inference_mode():
         try:
-            # Simple autoregressive generation
-            generated = input_ids.clone()
-            prev_pos = 0
-            for step in range(max_new_tokens):
-                logits = model.forward(generated[:, prev_pos:], prev_pos)
-                next_token = logits.argmax(dim=-1, keepdim=True).to(torch.long)
-                generated = torch.cat([generated, next_token], dim=-1)
-                prev_pos = generated.shape[1] - 1
-                eos_id = tokenizer.encode("<｜end▁of▁sentence｜>")[0] if tokenizer.eos_token_id is None else tokenizer.eos_token_id
-                if next_token.item() == eos_id:
-                    break
-                if is_main and (step + 1) % 10 == 0:
-                    print(f"  step {step+1}/{max_new_tokens}...", flush=True)
-
+            logits = model.forward(input_ids, 0)
             t5 = time.time()
-            output_text = tokenizer.decode(generated[0].tolist(), skip_special_tokens=True)
-            log(f"Generation OK! {t5-t4:.1f}s, {generated.shape[1] - input_ids.shape[1]} new tokens")
-            log(f"Output: {output_text}")
+            log(f"Prefill OK! {t5-t4:.1f}s")
+
+            # Save captured activations
+            for lid in target_layers:
+                if lid in captured:
+                    act = captured[lid]
+                    log(f"Layer {lid} residual: shape={act.shape}, dtype={act.dtype}")
+                    log(f"  4 streams norms: {[f'{act[0, -1, i].norm().item():.2f}' for i in range(4)]}")
+
+            if is_main and captured:
+                save_path = "/workspace/activations_layer28_29.pt"
+                torch.save({
+                    "prompt": prompt,
+                    "input_ids": input_ids.cpu(),
+                    "activations": captured,
+                    "target_layers": target_layers,
+                    "hc_mult": 4,
+                    "dim": 4096,
+                }, save_path)
+                log(f"Activations saved to {save_path}")
+
         except Exception as e:
             t5 = time.time()
-            log(f"Generation FAILED after {t5-t4:.1f}s")
+            log(f"Prefill FAILED after {t5-t4:.1f}s")
             import traceback
             traceback.print_exc()
+
+    # Clean up hooks
+    for h in hooks:
+        h.remove()
 
     log(f"Final GPU memory: {torch.cuda.memory_allocated()/1e9:.1f}GB")
 
