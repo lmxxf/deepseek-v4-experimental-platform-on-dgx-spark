@@ -146,6 +146,8 @@ for layer_id, act in data["activations"].items():
 | `run_dual_node.sh` | 双机启动脚本（含 NCCL 配置 + rsync 同步） |
 | `DevHistory.md` | 开发日志，记录了全部 21 个踩坑 |
 
+每个改动的详细说明和原因，参见 [WHAT_WE_CHANGED_zh.md](WHAT_WE_CHANGED_zh.md)。
+
 ## 自定义
 
 ### 提取不同的层

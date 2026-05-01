@@ -1,8 +1,8 @@
 # What We Changed (and Why)
 
-This project runs DeepSeek V4 Flash (280B) on DGX Spark **without modifying any official DeepSeek code**. Instead, we provide drop-in replacements that intercept at the import level.
+[中文版](WHAT_WE_CHANGED_zh.md)
 
-本项目在 **不修改任何 DeepSeek 官方代码** 的前提下，让 280B 模型在 DGX Spark 上运行。所有改动都是在 import 层面做的替换。
+This project runs DeepSeek V4 Flash (280B) on DGX Spark **without modifying any official DeepSeek code**. Instead, we provide drop-in replacements that intercept at the import level.
 
 ---
 

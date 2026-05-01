@@ -134,6 +134,8 @@ for layer_id, act in data["activations"].items():
 | `run_dual_node.sh` | Dual-node launch script with NCCL configuration |
 | `DevHistory.md` | Development log documenting all 21 pitfalls encountered |
 
+For a detailed explanation of every change and why it was necessary, see [WHAT_WE_CHANGED.md](WHAT_WE_CHANGED.md).
+
 ## Customization
 
 ### Different layers
