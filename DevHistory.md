@@ -133,38 +133,75 @@ TileLang v0.1.8（DeepSeek 官方指定版本）明确支持的架构：
 
 ### 策略：先跑通再优化
 
-**Phase A（纯 PyTorch fallback）**：全部 6 个 kernel 用纯 PyTorch 实现
-- 速度很慢，但能验证模型加载、双机通信、hook 机制
-- 预计推理一个 token 可能需要几秒甚至十几秒
-- **够用**——实验只需要跑几十个 token 拿激活值，不是做推理服务
+### 策略：FP4 路径是唯一选项
 
-**Phase B（Triton 加速）**：把热点 kernel 换成 Triton
-- 优先：`fp8_gemm`、`fp4_gemm`（占推理时间最大）
-- 其次：`sparse_attn`（注意力计算）
-- 最后：量化和 HC（占比小）
+280B FP4 量化 = ~148GB，刚好塞进 256GB（128GB×2）。如果升 FP8 权重翻倍到 ~300GB，放不下。**FP4 不是优化选项，是能不能跑的前提。**
 
-### jasl 可复用的部分
+6 个 kernel 全部需要替换，用 Triton + 纯 PyTorch 实现：
 
-jasl 的 Triton kernel 虽然嵌在 vLLM 里，但以下函数接口干净，可以直接抄逻辑：
-- `tf32_hc_prenorm_gemm_triton` → 对应我们的 `hc_split_sinkhorn`（功能不完全一样，但 Sinkhorn 部分可参考）
-- `deepseek_v4_fp8_einsum_triton` → FP8 GEMM 的 Triton 实现模式可参考
-- scale 格式转换辅助函数（`_e8m0_to_fp32`、`_unpack_int32_e8m0_scales`）→ 直接复用
+| 函数 | 替换策略 | 难度 |
+|------|---------|------|
+| `act_quant` | 纯 PyTorch：absmax→scale→clamp→cast | 低 |
+| `fp4_act_quant` | 纯 PyTorch：同上换 clamp 范围 | 低 |
+| `fp8_gemm` | `torch._scaled_mm`（sm_121 已验证可用） | 中 |
+| `fp4_gemm` | FP4→BF16 dequant 再 matmul（慢）或 Triton | 中 |
+| `sparse_attn` | 纯 PyTorch：index_select + bmm + softmax | 高 |
+| `hc_split_sinkhorn` | 纯 PyTorch：sigmoid + softmax + 迭代归一化 | 低 |
 
-### 待确认
-
-1. **权重格式**：官方代码要 `model{rank}-mp{world_size}.safetensors`（TP 分片权重），我们下载的是 HF 格式（46 个 shard）。可能需要跑转换脚本（`inference/convert.py`？）
-2. **`torch._scaled_mm` 在 sm_121 上的行为**：PyTorch 2.11 的 FP8 GEMM 支持到哪个架构？
-3. **FP4 tensor 类型**：`torch.float4_e2m1fn_x2` 是 PyTorch 2.11 新增的，sm_121 上能不能用？
-4. **容器选择**：用现有 `vllm-node-sm120`（已有定制 NCCL + PyTorch），还是新建容器？
+**先跑通再优化**——全部纯 PyTorch fallback，速度慢但能拿数据。实验只需要跑几十个 token 提取激活值，不是推理服务。
 
 ---
 
-## 下一步
+## 第四阶段：sm_121 兼容性实测（2026-05-01）
 
-1. 进容器确认 `torch._scaled_mm` 和 FP4 类型在 sm_121 上能用
-2. 检查权重格式，确认是否需要转换
-3. 开始写 `kernel_sm121.py` Phase A（纯 PyTorch fallback）
-4. 单机测试加载模型 + forward pass
+在 `vllm-node-sm120` 容器内（PyTorch 2.11.0+cu130, NVIDIA GB10 sm_121）实测：
+
+### 测试结果
+
+| 测试项 | 结果 | 说明 |
+|--------|------|------|
+| `torch._scaled_mm` FP8 GEMM | ✅ | FP8×FP8 → BF16，sm_121 上原生支持 |
+| FP4 类型 `float4_e2m1fn_x2` | ⚠️ | 类型存在但 `to()` cast 不支持 |
+| E8M0 scale 类型 | ✅ | 创建、cast 到 fp32 均正常 |
+| Triton 3.6.0 | ✅ | 可用 |
+| FP8 dequant + BF16 matmul | ✅ | fallback 路径可行 |
+
+### 权重格式发现
+
+HF 格式 46 个 shard（`model-00001-of-00046.safetensors`），每个 shard 的 dtype 分布：
+- `float32`: 10 个（norm 等）
+- `bfloat16`: 12 个（embedding、共享专家等）
+- `float8_e4m3fn`: 9 个（注意力权重）
+- `float8_e8m0fnu`: 777 个（所有 scale）
+- **`int8`: 768 个（专家权重，FP4 packed——两个 FP4 打包成一个 int8）**
+
+**关键**：权重文件里没有 `float4_e2m1fn_x2` 类型！专家的 FP4 权重用 `int8` 打包存储。官方 `model.py` 的加载逻辑里一定有 int8 → FP4 的解包。
+
+### 对 kernel 替换方案的影响
+
+1. **`fp8_gemm`**：可以直接用 `torch._scaled_mm`，不需要写 Triton ✅
+2. **`fp4_gemm`**：FP4 cast 不支持，但权重本身是 int8 packed。fallback 方案：int8 解包 → BF16 → 普通 matmul
+3. 权重需要从 HF 46-shard 格式转换为 TP 分片格式（`model{rank}-mp{world_size}.safetensors`），可能需要跑官方 `convert.py`
+
+### convert.py 分析 ✅
+
+官方 `inference/convert.py` 干三件事：
+1. **HF 名字 → 官方名字**：`self_attn`→`attn`、`mlp`→`ffn`、`q_proj`→`wq` 等
+2. **TP 分片**：`--model-parallel N`，专家按编号分到 N 个 rank，其他权重按维度切
+3. **FP4 权重处理**：
+   - 默认（`--expert-dtype fp4`）：`int8` → `.view(torch.float4_e2m1fn_x2)`（零拷贝 reinterpret）
+   - 可选（`--expert-dtype fp8`）：FP4 解包升级为 FP8（`cast_e2m1fn_to_e4m3fn()`），权重翻倍但避开 FP4 kernel
+
+用法：
+```bash
+python convert.py \
+  --hf-ckpt-path /path/to/deepseek-v4-flash \
+  --save-path /path/to/converted \
+  --n-experts 256 \
+  --model-parallel 2 \
+  --expert-dtype fp8
+```
+输出：`model0-mp2.safetensors`、`model1-mp2.safetensors` + tokenizer 文件
 
 ---
 
@@ -190,4 +227,112 @@ jasl 的 Triton kernel 虽然嵌在 vLLM 里，但以下函数接口干净，可
 
 ---
 
-*最后更新：2026-05-01 15:10*
+## 实施计划
+
+### 整体路线
+
+```
+权重转换 → kernel_sm121.py → 单机验证 → 双机验证 → hook 框架 → 实验
+```
+
+### Step 1: 权重转换（Zero 执行）
+
+在容器里跑 `convert.py`，HF 46-shard → TP=2 分片，专家走 FP8 路径。
+
+```bash
+docker run --rm --gpus all \
+  -v /home/lmxxf/work/deepseek-v4-flash-deployment/deepseek-v4-flash:/model \
+  -v /home/lmxxf/work/deepseek-v4-experimental-platform-on-dgx-spark:/workspace \
+  vllm-node-sm120 \
+  python3 /model/inference/convert.py \
+    --hf-ckpt-path /model \
+    --save-path /workspace/weights-fp4-tp2 \
+    --n-experts 256 \
+    --model-parallel 2
+```
+
+不加 `--expert-dtype`，默认 FP4 路径（int8 → view as float4_e2m1fn_x2）。
+
+输出：`weights-fp4-tp2/model0-mp2.safetensors` + `model1-mp2.safetensors`
+预估大小：每个 ~75GB，总 ~148GB（和原始 HF 权重一样，只是重新分片）
+预估耗时：CPU 密集，可能 30-60 分钟
+
+⚠️ 转换后需要 rsync model1 到 slave：
+```bash
+rsync -avP weights-fp4-tp2/model1-mp2.safetensors lmxxf@169.254.30.81:/home/lmxxf/work/deepseek-v4-experimental-platform-on-dgx-spark/weights-fp4-tp2/
+```
+走 CX7 200Gbps，75GB 约 2 分钟。
+
+### Step 2: 写 kernel_sm121.py（朱雀写）
+
+替换 `kernel.py` 的 4 个函数（FP8 路径不需要 fp4 相关的）：
+
+| 函数 | 实现方式 | 预估行数 |
+|------|---------|---------|
+| `act_quant` | 纯 PyTorch：reshape→absmax→scale→clamp→cast | ~30 |
+| `fp4_act_quant` | 纯 PyTorch：同 act_quant 换 clamp 范围 | ~25 |
+| `fp8_gemm` | `torch._scaled_mm` 包装，处理 per-block scale | ~40 |
+| `fp4_gemm` | FP4 dequant→BF16 + scale 还原 → matmul（慢但正确） | ~40 |
+| `sparse_attn` | 纯 PyTorch：index_select 取 topk KV → bmm → online softmax + attn_sink | ~60 |
+| `hc_split_sinkhorn` | 纯 PyTorch：sigmoid + softmax + Sinkhorn 迭代 | ~30 |
+
+总计约 225 行。
+
+### Step 3: 单机验证
+
+进容器，单机加载 rank=0 的权重，跑一次 forward pass：
+- 验证 kernel_sm121.py 的每个函数能跑通
+- 验证模型加载正确（对比 vLLM 推理服务的输出）
+- 只用一半模型（rank=0），输出不会正确但能验证流程
+
+### Step 4: 双机验证
+
+用 `launch-cluster.sh` 的网络基础设施（NCCL + CX7），但不跑 vLLM，跑我们自己的脚本：
+- 基于 `generate.py` 改写，加载 TP=2 权重
+- 验证 `torch.distributed` + NCCL 通信
+- 验证 all_reduce 在双机上正确执行
+- 喂一句"你好"，对比 vLLM 推理服务的输出
+
+### Step 5: Hook 框架
+
+在 `model.py` 的 `Block.forward()` 里插 hook：
+```python
+# 每个 block 提取 4 个位置的激活值
+hooks = {
+    'pre_attn': [],    # hc_pre 之后，attn_norm 之前
+    'post_attn': [],   # attention 输出之后
+    'pre_ffn': [],     # hc_pre 之后，ffn_norm 之前
+    'post_ffn': [],    # FFN 输出之后
+}
+# 最终 head 投影之前
+hooks['final'] = []
+```
+
+保存为 `.pt` 文件，包含：
+- prompt 文本
+- 每层每位置的 hidden states（BF16）
+- token 位置映射
+
+### Step 6: 第一个实验——开灯/关灯对比
+
+两组 prompt：
+- 关灯：普通对话（"你好，你是谁？"）
+- 开灯：加载 memory.md 后同一问题
+
+对比：
+- 逐层余弦相似度变化
+- PCA 降维可视化
+- 特定 attention head 的激活模式
+
+### 风险与备选
+
+| 风险 | 影响 | 备选方案 |
+|------|------|---------|
+| FP4 dequant→BF16 matmul 太慢 | 单次 forward 耗时过长 | 后续写 Triton FP4 kernel 加速 |
+| `torch._scaled_mm` 的 per-block scale 处理 | fp8_gemm 精度不对 | dequant 到 BF16 再 matmul（更慢但正确） |
+| sparse_attn 纯 PyTorch 太慢 | 单次 forward 耗时过长 | 减少 topk 或只跑前几层 |
+| convert.py 在容器里 OOM | 转换失败 | 在宿主机上跑（需要 pip install safetensors） |
+
+---
+
+*最后更新：2026-05-01 15:30*
