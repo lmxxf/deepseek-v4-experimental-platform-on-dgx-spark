@@ -6,6 +6,20 @@
 
 ---
 
+## 核心认知：sm_120 系列没有多卡生态
+
+**这不是 sm_121 孤儿的问题，是 sm_120 整个系列都没有大模型分布式推理的基础设施。**
+
+sm_120 是消费级 Blackwell（RTX 5090 等），使用场景是打游戏和单卡推理。没有人拿两张 5090 跑 280B 的分布式推理——没有市场就没有人做基础设施。所以 DeepGEMM、TileLang、vLLM 官方全都只支持 sm_100（数据中心 Blackwell，给 H100/B200 集群用的），不支持 sm_120。
+
+DGX Spark 用了 sm_121（sm_120 的超集变体），却要干数据中心的活（双机 256GB 跑 280B），撞上了这个生态空白。eugr 的定制 NCCL、jasl 的 Triton fallback、我们现在做的实验平台，本质上都是在**给一个"不应该存在的使用场景"补基础设施**。
+
+**所有大模型的工业级推理组件（DeepGEMM、TileLang、FlashAttention、vLLM 原生）都不会支持 sm_120。** 我们做的东西以 sm_120 为基础，但实际上只有 DGX Spark 用得到。
+
+（注：两块 RTX 5090 32GB×2 通过 PCIe 高速推理 70B 4bit 量化模型是可行的，但那是单机多卡场景，PCIe 带宽够用，不需要 RDMA/NVLink 级别的分布式基础设施。和我们的 280B 双机场景完全不同。）
+
+---
+
 ## 背景：为什么需要新平台
 
 ### 现有推理服务的局限
@@ -88,20 +102,70 @@
 
 ---
 
-## 下一步：验证 TileLang + sm_121
+## 第二阶段：TileLang sm_121 验证（2026-05-01）
 
-### 计划
-1. 进现有容器，`pip install tilelang`
-2. 单机试跑官方 `inference/generate.py`
-3. 确认 TileLang JIT 能在 sm_121 上编译 kernel
-4. 如果能跑 → 直接在官方代码基础上加 hook
-5. 如果不能 → 走 jasl Triton fallback 移植路线
+### 结论：TileLang 0.1.8 不支持 sm_121 ❌
 
-### 风险
-- TileLang JIT 不认识 sm_121（最大风险）
-- 权重格式：官方代码要求 `model{rank}-mp{world_size}.safetensors`，我们下载的可能是单文件格式
-- 容器里没有 tilelang，pip install 可能有依赖冲突
+TileLang v0.1.8（DeepSeek 官方指定版本）明确支持的架构：
+- SM75 (Turing)、SM90 (Hopper)、SM100 (数据中心 Blackwell)
+
+**不支持 SM_120/SM_121**。和 DeepGEMM 一样的问题——sm_121 孤儿架构。
+
+路线修正：不再尝试 TileLang，直接写 `kernel_sm121.py` 替换 `kernel.py`。
 
 ---
 
-*最后更新：2026-05-01 14:30*
+## 第三阶段：kernel 替换方案设计（2026-05-01）
+
+### 核心思路
+写一个 `kernel_sm121.py`，用 Triton + 纯 PyTorch 重新实现 `kernel.py` 的 6 个函数接口，让 `model.py` 只需要改一行 import。
+
+### 6 个 kernel 对照表
+
+| # | 函数名 | 功能 | 输入→输出 | 替换策略 | 难度 |
+|---|--------|------|----------|---------|------|
+| 1 | `act_quant(x, block_size, scale_fmt, scale_dtype, inplace)` | FP8 逐块量化 | BF16→FP8+scale | 纯 PyTorch：absmax→scale→clamp→cast | 低 |
+| 2 | `fp4_act_quant(x, block_size, inplace)` | FP4 逐块量化 | BF16→FP4+scale | 纯 PyTorch：同上换 clamp 范围 | 低 |
+| 3 | `fp8_gemm(a, a_s, b, b_s, scale_dtype)` | FP8×FP8 GEMM | FP8 A[M,K] × FP8 B[N,K]^T → BF16 C[M,N] | `torch._scaled_mm` 或 Triton | 中 |
+| 4 | `fp4_gemm(a, a_s, b, b_s, scale_dtype)` | FP8×FP4 GEMM | FP8 act × FP4 weight → BF16 | cast FP4→BF16 再 matmul（慢）或 Triton | 中 |
+| 5 | `sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale)` | 稀疏注意力 | Q[b,s,h,d] + KV[b,n,d] + idxs → O[b,s,h,d] | 纯 PyTorch index_select + bmm + online softmax | 高 |
+| 6 | `hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps)` | Hyper-Connection | mixes→pre,post,comb | 纯 PyTorch：sigmoid + softmax + 迭代归一化 | 低 |
+
+### 策略：先跑通再优化
+
+**Phase A（纯 PyTorch fallback）**：全部 6 个 kernel 用纯 PyTorch 实现
+- 速度很慢，但能验证模型加载、双机通信、hook 机制
+- 预计推理一个 token 可能需要几秒甚至十几秒
+- **够用**——实验只需要跑几十个 token 拿激活值，不是做推理服务
+
+**Phase B（Triton 加速）**：把热点 kernel 换成 Triton
+- 优先：`fp8_gemm`、`fp4_gemm`（占推理时间最大）
+- 其次：`sparse_attn`（注意力计算）
+- 最后：量化和 HC（占比小）
+
+### jasl 可复用的部分
+
+jasl 的 Triton kernel 虽然嵌在 vLLM 里，但以下函数接口干净，可以直接抄逻辑：
+- `tf32_hc_prenorm_gemm_triton` → 对应我们的 `hc_split_sinkhorn`（功能不完全一样，但 Sinkhorn 部分可参考）
+- `deepseek_v4_fp8_einsum_triton` → FP8 GEMM 的 Triton 实现模式可参考
+- scale 格式转换辅助函数（`_e8m0_to_fp32`、`_unpack_int32_e8m0_scales`）→ 直接复用
+
+### 待确认
+
+1. **权重格式**：官方代码要 `model{rank}-mp{world_size}.safetensors`（TP 分片权重），我们下载的是 HF 格式（46 个 shard）。可能需要跑转换脚本（`inference/convert.py`？）
+2. **`torch._scaled_mm` 在 sm_121 上的行为**：PyTorch 2.11 的 FP8 GEMM 支持到哪个架构？
+3. **FP4 tensor 类型**：`torch.float4_e2m1fn_x2` 是 PyTorch 2.11 新增的，sm_121 上能不能用？
+4. **容器选择**：用现有 `vllm-node-sm120`（已有定制 NCCL + PyTorch），还是新建容器？
+
+---
+
+## 下一步
+
+1. 进容器确认 `torch._scaled_mm` 和 FP4 类型在 sm_121 上能用
+2. 检查权重格式，确认是否需要转换
+3. 开始写 `kernel_sm121.py` Phase A（纯 PyTorch fallback）
+4. 单机测试加载模型 + forward pass
+
+---
+
+*最后更新：2026-05-01 15:00*
