@@ -156,11 +156,19 @@ x = self.hc_post(x, residual, ...)    # after HC post-mixing (4 streams)
 # same pattern for FFN
 ```
 
+## Who Can Use This
+
+- **DGX Spark users**: full solution, clone and run
+- **H100 / B200 users**: skip `kernel_sm121.py`, use official `kernel.py` — `weight_loader.py` and the hook framework work on any hardware
+- **Anyone studying LLM internals**: the FP4 manual unpacking and streaming weight loader are reusable techniques, not DGX Spark specific
+
+Even with a B200, you can't extract intermediate activations from a 280B model — vLLM doesn't expose hidden states, and the official `generate.py` only outputs final tokens. This platform solves that problem regardless of hardware.
+
 ## Limitations
 
 - **Slow**: ~1.8s/token (pure PyTorch). Fine for research, not for serving.
-- **Memory-tight**: 81.8GB used of 128GB per node.
-- **DGX Spark specific**: kernel replacements and weight loading strategy are tailored for sm_121 + unified memory.
+- **Memory-tight**: 81.8GB used of 128GB per node (DGX Spark).
+- **DGX Spark kernel replacements**: `kernel_sm121.py` is specific to sm_121; on datacenter GPUs, use the official `kernel.py` instead.
 
 ## Acknowledgments
 

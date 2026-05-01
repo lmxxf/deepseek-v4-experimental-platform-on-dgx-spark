@@ -170,11 +170,19 @@ x = self.hc_post(x, residual, ...)    # HC 后混合后（4 路）
 # FFN 部分同样模式
 ```
 
+## 谁能用
+
+- **有 DGX Spark 的用户**：完整方案，克隆即用
+- **有 H100 / B200 的用户**：跳过 `kernel_sm121.py`，用官方 `kernel.py`，`weight_loader.py` + hook 框架直接可用
+- **想学习 LLM 内部机制的人**：FP4 手动解包和流式权重加载是通用技术，不限于 DGX Spark
+
+即使你有 B200，你也做不到从 280B 模型里提取中间层激活值——vLLM 不暴露 hidden state，官方 `generate.py` 只输出最终 token。本平台解决的是这个问题，跟硬件无关。
+
 ## 局限性
 
 - **慢**：约 1.8 秒/token（纯 PyTorch）。做研究够用，不能当推理服务。
-- **内存紧张**：每台 128GB 中用了 81.8GB，剩余约 46GB 给激活值和计算。
-- **仅限 DGX Spark**：kernel 替换和权重加载策略是针对 sm_121 + 统一内存架构设计的。
+- **内存紧张**：每台 128GB 中用了 81.8GB（DGX Spark）。
+- **DGX Spark kernel 替换**：`kernel_sm121.py` 是针对 sm_121 的；数据中心 GPU 上直接用官方 `kernel.py`。
 
 ## 致谢
 
