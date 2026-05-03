@@ -1,5 +1,5 @@
 """
-双机验证脚本：TP=2 加载完整模型，跑一次 forward pass。
+双机验证脚本：TP=2 加载完整模型，跑 prefill + 自回归生成。
 直接读 HF 原始 46 shard（每个 ~3.5GB），不用 convert.py 预处理。
 """
 
@@ -39,9 +39,20 @@ def _patched_get_logits(self, x):
 _Head.get_logits = _patched_get_logits
 
 
+DREAM_SVG_PATH = "/workspace/input-text.md"
+
+def load_prompt():
+    """Load the dream SVG prompt."""
+    if os.path.exists(DREAM_SVG_PATH):
+        with open(DREAM_SVG_PATH) as f:
+            return f.read().strip()
+    return "你好，请用一句话介绍你自己。"
+
+
 def main():
     hf_ckpt_path = os.environ.get("HF_CKPT_PATH", "/model")
     config_path = os.environ.get("CONFIG_PATH", f"{INFERENCE_DIR}/config.json")
+    max_new_tokens = int(os.environ.get("MAX_NEW_TOKENS", "200"))
 
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     rank = int(os.environ.get("RANK", "0"))
@@ -71,7 +82,7 @@ def main():
     with open(config_path) as f:
         config = json.load(f)
     config["max_batch_size"] = 1
-    config["max_seq_len"] = 512
+    config["max_seq_len"] = 4096
     args = ModelArgs(**config)
     log(f"Config: {args.n_layers} layers, {args.n_routed_experts} experts, dim={args.dim}")
 
@@ -122,21 +133,22 @@ def main():
     encoding_dir = os.path.join(hf_ckpt_path, "encoding")
     sys.path.insert(0, encoding_dir)
     from encoding_dsv4 import encode_messages
-    log("Tokenizer loaded, starting generation...")
+    log("Tokenizer loaded")
 
-    prompt = "你好，请用一句话介绍你自己。"
-    messages = [{"role": "user", "content": prompt}]
+    # --- Load prompt ---
+    prompt_text = load_prompt()
+    messages = [{"role": "user", "content": prompt_text}]
     formatted = encode_messages(messages, thinking_mode="chat")
     input_ids = torch.tensor([tokenizer.encode(formatted)], dtype=torch.long, device="cuda")
-    log(f"Prompt: '{prompt}' → {input_ids.shape[1]} tokens")
+    prompt_len = input_ids.shape[1]
+    log(f"Prompt: {prompt_len} tokens (dream SVG: {os.path.exists(DREAM_SVG_PATH)})")
 
-    # === Hook: capture residual stream at 2/3 position (layer 28-29 of 43) ===
-    target_layers = [28, 29]
+    # === Hook: capture residual stream at layers 14, 28, 42 (early/mid/late) ===
+    target_layers = [14, 28, 42]
     captured = {}
 
     def make_hook(layer_id):
         def hook_fn(module, input, output):
-            # input[0] = x, shape [batch, seq, hc_mult, dim] = [1, seq, 4, 4096]
             x = input[0]
             captured[layer_id] = x.detach().cpu().clone()
         return hook_fn
@@ -147,25 +159,33 @@ def main():
         hooks.append(h)
     log(f"Hooks registered on layers {target_layers}")
 
-    # === Prefill: single forward pass to get activations ===
+    # === Prefill ===
     t4 = time.time()
+    generated_ids = []
     with torch.inference_mode():
         try:
             logits = model.forward(input_ids, 0)
             t5 = time.time()
-            log(f"Prefill OK! {t5-t4:.1f}s")
+            log(f"Prefill OK! {t5-t4:.1f}s for {prompt_len} tokens ({prompt_len/(t5-t4):.1f} tok/s)")
 
-            # Save captured activations
+            # Print captured activations
             for lid in target_layers:
                 if lid in captured:
                     act = captured[lid]
-                    log(f"Layer {lid} residual: shape={act.shape}, dtype={act.dtype}")
-                    log(f"  4 streams norms: {[f'{act[0, -1, i].norm().item():.2f}' for i in range(4)]}")
+                    log(f"Layer {lid} residual: shape={act.shape}")
+                    log(f"  4 HC norms (last token): {[f'{act[0, -1, i].norm().item():.2f}' for i in range(min(4, act.shape[2]))]}")
 
+            # Remove hooks after prefill (don't capture during generation)
+            for h in hooks:
+                h.remove()
+            hooks = []
+
+            # Save activations
             if is_main and captured:
-                save_path = "/workspace/activations_layer28_29.pt"
+                save_path = "/workspace/activations_dream.pt"
                 torch.save({
-                    "prompt": prompt,
+                    "prompt": prompt_text[:200] + "..." if len(prompt_text) > 200 else prompt_text,
+                    "prompt_tokens": prompt_len,
                     "input_ids": input_ids.cpu(),
                     "activations": captured,
                     "target_layers": target_layers,
@@ -174,15 +194,55 @@ def main():
                 }, save_path)
                 log(f"Activations saved to {save_path}")
 
+            # === Autoregressive generation ===
+            log(f"Starting generation (max {max_new_tokens} tokens)...")
+            next_token = logits.argmax(dim=-1)  # [1]
+            generated_ids.append(next_token.item())
+            start_pos = prompt_len
+
+            eos_id = tokenizer.encode("<｜end▁of▁sentence｜>")
+            eos_id = eos_id[0] if eos_id else None
+
+            t6 = time.time()
+            for step in range(max_new_tokens - 1):
+                token_input = next_token.unsqueeze(0)  # [1, 1]
+                logits = model.forward(token_input, start_pos)
+                next_token = logits.argmax(dim=-1)
+                tid = next_token.item()
+                generated_ids.append(tid)
+                start_pos += 1
+
+                if eos_id is not None and tid == eos_id:
+                    break
+
+            t7 = time.time()
+            gen_tokens = len(generated_ids)
+            gen_time = t7 - t6
+            log(f"Generation done: {gen_tokens} tokens in {gen_time:.1f}s ({gen_tokens/gen_time:.2f} tok/s)")
+
+            # Decode and print output
+            if is_main:
+                output_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+                print("\n" + "="*60, flush=True)
+                print("DeepSeek V4 Flash Output:", flush=True)
+                print("="*60, flush=True)
+                print(output_text, flush=True)
+                print("="*60 + "\n", flush=True)
+
         except Exception as e:
             t5 = time.time()
-            log(f"Prefill FAILED after {t5-t4:.1f}s")
+            log(f"FAILED after {t5-t4:.1f}s")
             import traceback
             traceback.print_exc()
 
-    # Clean up hooks
+    # Clean up any remaining hooks
     for h in hooks:
         h.remove()
+
+    # Print kernel profiling report
+    if is_main:
+        from kernel_sm121 import profile_report
+        profile_report()
 
     log(f"Final GPU memory: {torch.cuda.memory_allocated()/1e9:.1f}GB")
 

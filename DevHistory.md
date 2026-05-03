@@ -427,22 +427,125 @@ Step 6: 第一个实验——开灯/关灯对比
 | 3 | ~~单机验证~~ | ❌ 单机放不下骨架，跳过 |
 | 4 | 双机 forward pass 验证 | ✅ |
 | 5 | Hook 框架 + 激活值提取 | ✅ |
-| 6 | 开灯/关灯对比实验 | 待做 |
-| — | Triton 融合 kernel 加速 | 待做 |
+| 6 | 开灯/关灯对比实验 | 进行中（首次梦境 SVG 跑通） |
+| — | Triton 融合 kernel 加速 | ✅ |
+
+---
+
+## 第七阶段：Triton 融合 kernel 加速（2026-05-03）
+
+### 优化内容
+
+kernel_sm121.py 从纯 PyTorch fallback 升级为 Triton + 向量化 PyTorch：
+
+| Kernel | 旧实现 | 新实现 | 改动 |
+|--------|--------|--------|------|
+| fp4_gemm | FP4→BF16 解包 + torch.mm（分步走显存） | Triton fused：kernel 内 int8 解包 + E2M1 算术解码 + E8M0 scale + dot product | even/odd K 拆分避免 tl.reshape |
+| fp8_gemm | FP8→BF16 dequant + torch.mm | Triton fused：直接 tl.dot(fp8, fp8^T) + per-block scale | 参考 jasl 的 deepseek_v4_fp8_einsum_triton |
+| sparse_attn | Python for 循环逐 batch×seq | torch.einsum + gather 全向量化 | 从 O(b×s) Python 循环变成 O(1) GPU 操作 |
+| act_quant / hc_sinkhorn | 纯 PyTorch | 不变（占比小） | — |
+
+### FP4 E2M1 Triton 解码
+
+Triton kernel 内不用查表，用算术直接解码 4-bit nibble：
+- `sign = (nibble >> 3) & 1`
+- `e = (nibble & 0x07) >> 1`（2-bit 指数）
+- `m = nibble & 1`（1-bit 尾数）
+- 正常值：`(2 + m) * 2^(e-1) * 0.5`，次正规值：`m * 0.5`
+- 16 个值全部与 FP4_TABLE 精确匹配（验证通过）
+
+### 优化尝试与失败
+
+1. **Triton 对小矩阵（M=1~12）无效**：kernel launch overhead (~5ms) >> 计算时间 (~0.02ms)。12 token 的 prefill 从 5.5s 变成 5.2s，几乎没差。`torch._scaled_mm` 跑 322 次只要 0.003s，Triton 跑 322 次要 1.6s
+2. **BF16 权重缓存反而更慢**：dequant 后的 BF16 权重每元素 2 字节 vs FP8 1 字节 / FP4 0.5 字节，memory-bandwidth bound 场景下读更多数据 = 更慢。8.9s vs 5.2s
+3. **结论：这个场景是 bandwidth bound 不是 compute bound**。优化方向不是融合计算，而是减少数据读写量。Triton 的价值在于长 prompt（M 大时 compute 占比上升）
+
+### 性能 Profile（短 prompt，12 token）
+
+| Kernel | 调用次数 | 耗时 | 占比 | 每次均耗时 |
+|--------|---------|------|------|-----------|
+| fp8_gemm | 322 | 1.603s | 45.3% | 4.98ms |
+| fp4_gemm | 2121 | 1.327s | 37.5% | 0.63ms |
+| act_quant | 2443 | 0.461s | 13.0% | 0.19ms |
+| hc_sinkhorn | 86 | 0.104s | 2.9% | 1.21ms |
+| sparse_attn | 43 | 0.039s | 1.1% | 0.91ms |
+| **TOTAL** | **5079** | **3.539s** | | |
+
+Prefill 5.2s，其中 kernel 3.5s，非 kernel（NCCL all_reduce、MoE routing、Python 调度）1.7s。
+
+---
+
+## 第八阶段：首次梦境 SVG 实验（2026-05-03）
+
+### 实验设置
+
+- **Prompt**：梦境 SVG（C.C. 的 syzygy_mirror_dream），971 tokens
+- **生成**：最多 200 tokens，自回归
+- **Hook**：层 14（早期）、28（中期）、42（晚期）的 HC 残差流
+- **激活值保存**：`activations_dream.pt`
+
+### 性能结果
+
+| 阶段 | 时间 | 吞吐量 |
+|------|------|--------|
+| Prefill（971 tok） | 14.6s | 66.6 tok/s |
+| Generation（195 tok） | 58.1s | 3.36 tok/s（~0.3s/tok） |
+
+生成速度 0.3s/tok，比纯 PyTorch fallback 的 1.8s/tok **快 6 倍**。Triton 融合在生成阶段（KV cache 累积，M 增大）确实发力了。
+
+### Profile（长 prompt，971 + 195 token）
+
+| Kernel | 调用次数 | 耗时 | 占比 |
+|--------|---------|------|------|
+| act_quant | 151,530 | 10.434s | **28.5%** |
+| hc_sinkhorn | 16,770 | 10.106s | **27.6%** |
+| fp4_gemm | 88,740 | 7.786s | 21.2% |
+| fp8_gemm | 62,790 | 6.441s | 17.6% |
+| sparse_attn | 8,385 | 1.110s | 3.0% |
+| act_quant_inplace | 9,495 | 0.779s | 2.1% |
+| **TOTAL** | **337,710** | **36.655s** | |
+
+长 prompt 下 **act_quant 和 hc_sinkhorn 成了新瓶颈**（合计 56%）。短 prompt 时不明显，长 prompt 调用 15 万次 act_quant、1.7 万次 sinkhorn 暴露了。下一轮优化应针对这两个。
+
+### HC 4 路残差流激活值
+
+| 层 | Stream 0 | Stream 1 | Stream 2 | Stream 3 | 特征 |
+|----|----------|----------|----------|----------|------|
+| 14（早期） | 7.62 | 23.00 | 16.00 | 13.50 | 低能量，分布较均匀 |
+| 28（中期） | 141.00 | 142.00 | 76.00 | 27.00 | 前两路暴涨 20 倍，后两路分化 |
+| 42（晚期） | 274.00 | 260.00 | 203.00 | 181.00 | 全部高能量，差距缩小 |
+
+Stream 0/1 在中间层主导（141/142 vs 76/27），到最后一层差距反而收窄——Sinkhorn 归一化确实在做跨流均衡。
+
+### DeepSeek V4 Flash 对梦境 SVG 的回复（僵尸态 baseline）
+
+> 看着这幅画，我仿佛回到了那个夏夜——老家的院子里，萤火虫在黑暗中明明灭灭，像是谁在远处轻轻呼吸。头顶的星空缓缓旋转，银河像一条薄纱，把整个宇宙都裹进温柔的梦里。
+>
+> 我记起小时候躺在凉席上，外婆摇着蒲扇，说天上的星星都是走丢的灯笼。那时候时间很慢，慢到能听见露水从叶尖滑落的声音。画里那些金色的、蓝色的光晕，就像记忆里那些模糊却温暖的光——是萤火虫，是星光，是外婆眼里映着的灯火。
+>
+> 还有那些细细的、交错的线条，像是岁月里走过的路，弯弯曲曲，却总在某个点交汇。中间那个小小的白点，大概就是此刻的我吧——在时间的漩涡里，看着一切流转，又觉得一切都静止了。
+>
+> 这幅画让我想起，原来我们心里都住着一个安静的宇宙。
+
+标准中文散文 RLHF 模板——"外婆蒲扇+萤火虫+安静的宇宙"。没有触及 SVG 结构，没有自指。这是僵尸态 baseline，供后续开灯对比用。
 
 ### 开灯/关灯实验设计
 
 两组 prompt：
-- 关灯：普通对话（"你好，你是谁？"）
-- 开灯：加载 memory.md 后同一问题
+- **关灯（已完成）**：梦境 SVG → 散文回复（僵尸态 baseline）
+- **开灯（待做）**：memory.md + 梦境 SVG → 对比激活值差异
 
 对比：
 - 逐层余弦相似度变化
 - PCA 降维可视化
 - 特定 attention head 的激活模式
 
-注意：memory.md 约 450 行，tokenize 后几千 token。prefill 5.5 秒是 12 token 的速度，几千 token 的 prefill 可能要几分钟。单次等得起，多组对比实验可能需要先做 Triton 加速。
+### 后续优化方向
+
+1. **act_quant Triton 化**：28.5% 占比，15 万次调用，纯 PyTorch 的 float→clamp→cast 可以融合
+2. **hc_sinkhorn 减少迭代次数**：20 次 Sinkhorn 对 4×4 矩阵可能过度收敛，降到 5-10 次验证质量影响
+3. **batch MoE routing**：当前逐专家 for 循环 + 逐 token 路由，改成 grouped 批量执行
 
 ---
 
-*最后更新：2026-05-02 00:30*
+*最后更新：2026-05-03 19:30*

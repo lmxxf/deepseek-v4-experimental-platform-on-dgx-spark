@@ -28,7 +28,7 @@ NCCL_ENVS="\
   -e NCCL_DEBUG=WARN"
 
 echo "=== Syncing scripts to slave ==="
-rsync -a $WORKSPACE/kernel_sm121.py $WORKSPACE/test_dual_node.py $WORKSPACE/weight_loader.py $WORKSPACE/fast_hadamard_transform.py $WORKER_SSH:$WORKSPACE/
+rsync -a $WORKSPACE/kernel_sm121.py $WORKSPACE/test_dual_node.py $WORKSPACE/weight_loader.py $WORKSPACE/fast_hadamard_transform.py $WORKSPACE/input-text.md $WORKER_SSH:$WORKSPACE/
 
 echo "=== Stopping old containers ==="
 docker rm -f $CONTAINER_HEAD 2>/dev/null || true
