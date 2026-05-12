@@ -47,6 +47,7 @@ ssh $WORKER_SSH "docker run -d --gpus all \
   -e WORLD_SIZE=2 \
   -e RANK=1 \
   -e LOCAL_RANK=0 \
+  -e PYTHONUNBUFFERED=1 \
   $NCCL_ENVS \
   $IMAGE \
   python3 /workspace/test_dual_node.py"
@@ -64,6 +65,7 @@ docker run --rm --gpus all \
   -e WORLD_SIZE=2 \
   -e RANK=0 \
   -e LOCAL_RANK=0 \
+  -e PYTHONUNBUFFERED=1 \
   $NCCL_ENVS \
   $IMAGE \
   python3 /workspace/test_dual_node.py

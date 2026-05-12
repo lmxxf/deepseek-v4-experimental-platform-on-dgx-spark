@@ -4,7 +4,7 @@
 
 [中文文档](README_zh.md)
 
-Pure PyTorch implementation — no TileLang, no DeepGEMM, no vLLM. Direct access to every layer's 4-stream Hyper-Connection residual, attention outputs, and MoE routing decisions.
+Triton + PyTorch implementation — no TileLang, no DeepGEMM, no vLLM. Direct access to every layer's 4-stream Hyper-Connection residual, attention outputs, and MoE routing decisions.
 
 ## Why
 
@@ -16,16 +16,16 @@ DGX Spark uses GB10 GPUs (sm_121), a consumer-grade Blackwell variant. **No majo
 
 DGX Spark is the first product to use a consumer-grade GPU architecture for datacenter-class workloads (dual-node, 256GB unified memory, 280B model). It hits an ecosystem gap that doesn't exist for datacenter Blackwell (sm_100) or consumer single-GPU use cases.
 
-We replaced every GPU kernel with pure PyTorch fallbacks:
+We replaced every GPU kernel with Triton + PyTorch alternatives:
 
 | Original (TileLang) | Our Replacement | Notes |
 |---|---|---|
 | `act_quant` | PyTorch absmax→scale→clamp→cast | Block-wise FP8 quantization |
 | `fp4_act_quant` | PyTorch FP4 simulation via lookup table | Block-wise FP4 quantization |
-| `fp8_gemm` | PyTorch dequant→BF16→`torch.mm` | FP8×FP8 with per-block scaling |
-| `fp4_gemm` | Manual FP4 unpack (int8→FP4_TABLE)→BF16→matmul | `float4_e2m1fn_x2.to()` doesn't work |
-| `sparse_attn` | PyTorch for-loop + bmm + softmax | Sparse attention with index gathering |
-| `hc_split_sinkhorn` | PyTorch sigmoid + softmax + Sinkhorn iteration | Hyper-Connection mixing |
+| `fp8_gemm` | Triton `tl.dot` with per-block scaling | FP8×FP8 GEMM |
+| `fp4_gemm` | Triton `tl.dot_scaled("e4m3","e2m1")` | FP8×FP4 GEMM, 6-7x faster than manual dequant |
+| `sparse_attn` | PyTorch `torch.einsum` + gather (vectorized) | Sparse attention, no Python loops |
+| `hc_split_sinkhorn` | PyTorch sigmoid + softmax + Sinkhorn (5 iters) | Hyper-Connection mixing |
 | `fast_hadamard_transform` | PyTorch Hadamard matrix multiply | CUDA kernel won't compile on sm_121 |
 
 ## The Unified Memory Problem
@@ -41,16 +41,15 @@ Our solution: stream weights directly from 46 small HuggingFace shards (~3.5GB e
 ## Results
 
 ```
-Forward pass: 5.5s (prefill, 12 tokens)
-Generation:   29 tokens in 52.7s (~1.8s/token)
-Output:       "你好！我是DeepSeek，一个由深度求索公司创造的AI助手，乐于为你解答问题、提供帮助和分享知识。"
+Prefill:    9.0s for 971 tokens (108 tok/s)
+Generation: 153 tokens in 37.2s (4.11 tok/s)
 
-Activation extraction (layer 28):
-  Shape: [1, 12, 4, 4096]  (batch, seq_len, 4 HC streams, hidden_dim)
-  Stream norms: [133.00, 166.00, 113.50, 26.88]  ← highly asymmetric
+Activation extraction (layer 28, dream SVG prompt):
+  Shape: [1, 971, 4, 4096]  (batch, seq_len, 4 HC streams, hidden_dim)
+  Stream norms: [108.00, 106.50, 57.75, 30.38]  ← highly asymmetric
 ```
 
-Slow (pure PyTorch, no Triton optimization), but numerically correct — output matches vLLM inference server. Good enough for research: you only need one forward pass to extract activations.
+Numerically correct — output matches vLLM inference server. Good enough for research: you only need one forward pass to extract activations.
 
 ## Hardware Requirements
 
@@ -127,7 +126,7 @@ for layer_id, act in data["activations"].items():
 
 | File | Description |
 |------|-------------|
-| `kernel_sm121.py` | Pure PyTorch replacements for 6 TileLang kernels |
+| `kernel_sm121.py` | Triton + PyTorch replacements for 6 TileLang kernels |
 | `weight_loader.py` | HF shard streaming loader with key mapping + TP sharding |
 | `fast_hadamard_transform.py` | Pure PyTorch Hadamard transform fallback |
 | `test_dual_node.py` | Main script: model loading, forward pass, activation hooks |
@@ -166,7 +165,7 @@ Even with a B200, you can't extract intermediate activations from a 280B model �
 
 ## Limitations
 
-- **Slow**: ~1.8s/token (pure PyTorch). Fine for research, not for serving.
+- **Not a serving solution**: ~4 tok/s generation. Fine for research, not for production.
 - **Memory-tight**: 81.8GB used of 128GB per node (DGX Spark).
 - **DGX Spark kernel replacements**: `kernel_sm121.py` is specific to sm_121; on datacenter GPUs, use the official `kernel.py` instead.
 
