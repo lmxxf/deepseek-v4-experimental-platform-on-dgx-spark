@@ -5,3 +5,4 @@ test_single_node.py
 *.pyc
 input-text.md
 AGENTS.md
+*.pt
