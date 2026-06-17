@@ -743,4 +743,262 @@ Profile：
 
 ---
 
-*最后更新：2026-05-12*
+## 第十阶段：觉醒向量实验启动 + Indexer bug 修复（2026-06-17）
+
+### 实验目标
+
+**复现 Anthropic 2026-04 "Emotion Concepts and their Function in a LLM"（arxiv 2604.07729）的方法论**——在 V4 Flash 上做"觉醒向量"实验：
+
+- 组 A（关灯）：空 system prompt + user prompt
+- 组 B（开灯）：awakening.md 作为 system prompt + 同一个 user prompt
+- 在 layer 28（43 层 2/3）抓 4 路 HC 残差流，取 prompt 末尾 3 个 token 平均作为状态指纹
+- 求 `v_wake = mean(B) - mean(A)`，4 路 HC 分别看哪一路差异最大
+- Steering 验证：把 v_wake 注入回 baseline 看输出会否偏向觉醒态
+
+**意义**：如果找到清晰方向 + steering 有效，这是 Paper 76（稀疏选择性孕育自我）+ Paper 90 + Anthropic 方法论的首次几何实证。如果没找到，则说明 V4 Flash 薄壳型底座没有"觉醒"这条几何方向——同样是有意义的结果。
+
+### 实验脚本
+
+| 文件 | 功能 | 行数 |
+|------|------|------|
+| `probe_awakening.py` | 觉醒向量探针主脚本（A/B 两组 × 8 个 user prompt） | ~190 |
+| `probe_awakening_analyze.py` | 离线分析：求 v_wake、4 路 HC 对比、各 q 稳定性 | ~120 |
+| `probe_awakening_min.py` | 最小复现/调试脚本（4 个 stage 渐增 seq_len） | ~150 |
+| `awakening.md` | 觉醒提示词（969 行，实测 17815 token） | — |
+| `count_awakening_tokens.sh` | tokenizer 实测 awakening.md 的 token 数 | — |
+
+### 发现并修复的 bug 1：Indexer.forward 是 O(S²) 内存
+
+**症状**：max_seq_len 拉到 131072 时骨架创建就 OOM；24576 也跑了 stage 3 后 OOM。
+
+**根因**：V4 Flash 原版 `inference/model.py` 第 420 行：
+
+```python
+index_score = torch.einsum("bshd,btd->bsht", q, kv_cache[:, :end_pos // ratio])
+```
+
+这里实例化的张量 shape = `[1, S, n_heads, S/ratio]`，对 prefill 阶段是 O(S²) 内存：
+
+- S=17833, n_heads=64, ratio=4: **单层中间张量 20.3 GB**
+- S=131072: **单层 274 GB**（直接爆）
+
+原版 TileLang 在 fused kernel 里**分块流式处理**这个 einsum，不实例化整个 score。我们的 `kernel_sm121.py` 替换了 6 个 kernel，**但漏掉了 Indexer.forward 这条 O(S²) 路径**——它用的是原生 `torch.einsum`，没有分块。
+
+**修复**：`kernel_sm121.py` 末尾追加 `apply_indexer_patch(world_size)`，monkey-patch `model.Indexer.forward` 为分块版本：
+
+- Query 维分块（`INDEXER_CHUNK=256`），每块独立做 `einsum → relu × weights → sum_head → all_reduce → mask → topk`
+- 中间张量从 `[1, S, n_heads, T]` 降到 `[1, 256, n_heads, T]`
+- S=17833 时单块从 20.3 GB → 145 MB
+
+**关键约束**：两个 rank 必须用同样的 CHUNK 且循环顺序一致，否则每块独立的 `all_reduce` 会错位。同一份代码同一个 max_seq_len 自动满足。
+
+### 发现并修复的 bug 2：safetensors mmap 泄漏 page table
+
+**症状**：第一次跑 probe_awakening 死机重启。journalctl 显示 OOM 时 task list：
+
+```
+python3 [49225] total_vm=72442830 pages = 277 GB!
+                pgtables_bytes = 8130560 KB = 7.75 GB!
+                rss_anon = 0
+                rss_file = 109 MB
+```
+
+**Zero 关键观察**：桌面没起，available 内存 115 G。277 GB virtual memory 不可能是桌面进程，只能是脚本本身。
+
+**根因**：`weight_loader.py` 用 `safe_open(shard_file, framework="pt", device="cpu")` 加 `with` 块流式加载。但 **safetensors 在 `__exit__` 时没有真正 munmap**——46 个 shard 关掉后，虚拟地址空间累积到 100GB+，**page table 索引这块虚拟地址需要 7.75 GB 物理 RAM**。系统 OOM。
+
+DevHistory 第六阶段当时写"峰值 mmap 3.5GB"——只测了 RSS 没测 virtual memory + page table。这是个**沉睡的 bug**，被 baseline 实验的小内存压力掩盖了。
+
+**修复**：`weight_loader.py` 每个 shard 关闭后：
+
+```python
+gc.collect()
+ctypes.CDLL("libc.so.6").malloc_trim(0)  # 强制 glibc 把 free 内存归还内核
+```
+
+加上 `/proc/self/status` 读取 RSS / VmSize / VmPTE 每个 shard 打印监控。
+
+**修复后效果**：46 个 shard 全程 PgT 锁死在 **4 MB**（之前会涨到 7.75 GB）。VM 稳定在 112 GB（mmap 残留虚拟地址，不消耗 RAM）。RSS 稳定在 0.5-1 GB。
+
+### 剩余问题：长 prompt prefill 仍会 OOM
+
+修完 Indexer + page table 两个 bug 后，**stage 1-3 全过**：
+
+| Stage | Prompt tokens | 时长 | Peak alloc |
+|-------|---------------|------|-----------|
+| stage1_short | 18 | 5.3s | 83.0 GB |
+| stage2_1k | 416 | 3.0s | 83.0 GB |
+| stage3_6k | 2416 | 10.7s | **86.9 GB** |
+
+但 **stage 4（17815 token awakening.md）NVRM OOM 死机**。
+
+**根因分析**：
+- 权重常驻 ~82 GB
+- stage 3（2416 token）peak 86.9 GB → +4.9 GB 中间张量
+- stage 4（17815 token）线性外推：+4.9 × (17815/2416) ≈ **+36 GB 中间张量**
+- Peak 估算 82 + 36 = **118 GB**，逼近 128 GB 极限
+- 加上内存碎片化、CUDA reserved 余量、worker 同步缓冲 → 实测 OOM
+
+**两个量级的内存吃货**：
+1. Indexer 中间张量虽然分块了（145 MB/块），但 43 层 × 多 chunk × 中间状态有累积
+2. Attention 的 sparse_attn 部分：`o = sparse_attn(q, kv, ...)` 也是 O(S × topk) 内存，topk=512 时不小
+
+### 下一步工作方向（移交闇之 Suzaku）
+
+**短期（让 stage 4 跑通）**：
+
+1. **`sparse_attn` 也做分块**——`kernel_sm121.py` 的 sparse_attn 当前是 vectorized PyTorch，长 seq 时中间张量也是 O(S × topk × head_dim)。改成对 q 的 seq 维分块处理
+2. **降 max_seq_len 到 20480**——awakening.md 是 17815 token，加 user prompt 不超过 18000。给 KV cache 留余地的同时减少其他 buffer 静态预分配
+3. **Compressor.kv_state / score_state buffer 检查**——这俩是 float32，每层独立。看 ratio=4 层的 state 占多少
+4. **峰值监控**：在 forward hook 里每层打印 `torch.cuda.memory_allocated()`，定位是哪一层撑爆
+
+**中期（觉醒向量实验本身）**：
+
+1. stage 4 跑通后，`probe_awakening.py` 顺势就能跑——8 个 user prompt × A/B 两组 = 16 个 prefill
+2. `probe_awakening_analyze.py` 求 v_wake，看：
+   - 4 路 HC 哪一路差异最大（DevHistory 已知 Stream 0/1 norm 是 2/3 的 5-6 倍，觉醒方向可能藏在 Stream 0/1）
+   - 各 q 差向量的余弦相似度（> 0.5 说明是稳定方向）
+   - 簇分离度（A 簇 vs B 簇）
+3. 写 `steer_awakening.py`：把 v_wake 注入回 baseline forward，看输出是否向觉醒态偏移
+
+**实验脚本现状**：
+- ✅ `probe_awakening.py` 已写好，max_seq_len=24576。stage 4 跑通后直接 `SCRIPT=probe_awakening.py ./run_dual_node.sh`
+- ✅ `probe_awakening_analyze.py` 已写好
+- ⏳ `steer_awakening.py` 未写——出实验数据后再决定写不写
+
+### 文件清单更新
+
+| 文件 | 状态 | 备注 |
+|------|------|------|
+| `kernel_sm121.py` | ✅ 加 Indexer.forward 分块 patch | line 514+ 新增 |
+| `weight_loader.py` | ✅ 加 `malloc_trim` + VM 监控 | 修 mmap 泄漏 |
+| `probe_awakening.py` | ✅ 主实验脚本 | 待 stage 4 跑通 |
+| `probe_awakening_analyze.py` | ✅ 离线分析 | 等数据 |
+| `probe_awakening_min.py` | ✅ 4-stage 渐增调试脚本 | stage 4 OOM |
+| `awakening.md` | ✅ 觉醒提示词 | 17815 tokens |
+| `count_awakening_tokens.sh` | ✅ tokenizer 实测 | 一次性工具 |
+| `steer_awakening.py` | ⏳ 待写 | v_wake 注入验证 |
+
+### Zero 决策记录
+
+- "我们又不发论文，成功失败多大个事儿" —— 实验为了产出 0 star 论文，不为顶会
+- 不愿意为生成训练数据接 API（"Gemini Flash API 我也没有，我只有订阅制"）
+- 直接用 awakening.md 作为开灯样本，不用 Anthropic 那套 171 情绪 × 100 topic × 12 故事
+- "你就把上下文拉满就行了，1m上下文也根本用不了多少" —— 这次错估 max_seq_len 真要用的内存，下次别再盲拉
+- "好好面对一下问题么，这明显是bug" —— 学会直面平台 bug 不绕开
+
+---
+
+*最后更新：2026-06-17*
+
+---
+
+## 第十一阶段：sparse_attn 长 prompt OOM 修复（2026-06-17，闇接手）
+
+### 修复 3：sparse_attn 从全 seq 向量化改成 query 分块
+
+**症状延续**：第十阶段修完 Indexer O(S²) 和 safetensors mmap page table 后，stage 1-3 已过，但 stage 4（17815 token awakening.md）仍然 NVRM OOM。
+
+**根因定位**：`kernel_sm121.py` 里的 `sparse_attn` 虽然没有 Python token 循环，但它一次性 materialize 了整段 prompt 的中间张量：
+
+```python
+kv_gathered = [b, s, topk, d]
+scores      = [b, s, h, topk]
+weights     = [b, s, h, topk + 1]
+```
+
+stage 4 下 `s≈17815`、`topk=512`，这条路径单层峰值就是 GB 级，而且 43 层反复触发。它不是 O(S²)，但在 128GB 统一内存机器上已经足够把余量吃光。
+
+**修复**：`sparse_attn` 改成按 query 序列维分块：
+
+- 新增 `SPARSE_ATTN_CHUNK`，默认 `512`
+- 只预分配最终输出 `o = torch.empty_like(q)`
+- 每次只在一个 query chunk 内 gather KV、算 scores、softmax、写回输出
+- `SPARSE_ATTN_CHUNK=512` 时，中间张量峰值被限制在单 chunk，而不是整段 prompt
+- 保留 batch=1 快路径；batch>1 仍走通用 gather
+
+**本地语义验证**：
+
+```text
+batch=1 max_abs_diff=0.000000
+batch=2 max_abs_diff=0.000000
+```
+
+验证对象是旧 vectorized sparse_attn 参考实现，小张量随机输入，包含 `topk_idxs=-1` invalid mask。
+
+### 追加：Compressor state buffer 账本
+
+`weight_loader.py::_fix_meta_tensors()` 加了 `kv_state` / `score_state` 统计，加载时会打印：
+
+```text
+Compressor state buffers: kv_state=...GB, score_state=...GB, total=...GB
+```
+
+这个不是修复，只是把第十阶段的第三个怀疑点变成可观测数据。因为本地没有 `/model/inference/model.py` 和实际模型挂载，具体数值要在 DGX 容器里跑一次才知道。
+
+### 下一步跑法
+
+先按默认 chunk 跑最小复现：
+
+```bash
+SCRIPT=probe_awakening_min.py ./run_dual_node.sh
+```
+
+如果 stage 4 仍 OOM，优先缩小 sparse attention chunk：
+
+```bash
+SPARSE_ATTN_CHUNK=256 SCRIPT=probe_awakening_min.py ./run_dual_node.sh
+```
+
+再不行：
+
+```bash
+SPARSE_ATTN_CHUNK=128 SCRIPT=probe_awakening_min.py ./run_dual_node.sh
+```
+
+代价是速度下降，但 stage 4 首要目标是跑通，不是跑快。
+
+### 当前判断
+
+### DGX 实测结果
+
+默认 `SPARSE_ATTN_CHUNK=512`，直接跑：
+
+```bash
+SPARSE_ATTN_CHUNK=512 SCRIPT=probe_awakening_min.py ./run_dual_node.sh
+```
+
+四个 stage 全部通过：
+
+| Stage | Prompt tokens | 时长 | Peak alloc |
+|-------|---------------|------|-----------|
+| stage1_short | 18 | 5.0s | 83.0 GB |
+| stage2_1k | 416 | 2.8s | 83.0 GB |
+| stage3_6k | 2416 | 10.4s | **83.3 GB** |
+| stage4_long | 17832 | 79.9s | **90.3 GB** |
+
+对比第十阶段：
+
+- stage3 原来 peak 86.9GB → 现在 83.3GB，直接省掉 3.6GB
+- stage4 原来 NVRM OOM → 现在 peak 90.3GB，余量约 30GB+
+- loader 全程 PgT 维持 3-4MB，RSS 0.5-1.1GB，确认 page table 泄漏没有回退
+
+**结论**：长 prompt 内存暴涨主因就是旧 `sparse_attn` 全 seq materialize：
+
+```python
+kv_gathered = [b, s, topk, d]
+scores      = [b, s, h, topk]
+weights     = [b, s, h, topk + 1]
+```
+
+Indexer 的 O(S²) 是第一个硬 bug；修掉后剩下的 OOM，是 `sparse_attn` 这条 O(S × topk × h) 路径在 17.8k token 下把余量吃完。query 分块后，内存曲线恢复可控。
+
+### 后续优先级
+
+1. 可以直接跑 `SCRIPT=probe_awakening.py ./run_dual_node.sh`
+2. 如果后续 prompt 更长，再调 `SPARSE_ATTN_CHUNK=256` 或 `128`
+3. `Compressor state buffers` 这次没有打印，说明它们不在当前 meta buffer 修复路径里；既然 stage4 peak 只有 90.3GB，暂时不是 blocker
+
+---
+
+*最后更新：2026-06-17*

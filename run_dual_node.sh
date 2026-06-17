@@ -31,7 +31,7 @@ NCCL_ENVS="\
 RUN_SCRIPT="${SCRIPT:-probe_poem.py}"
 
 echo "=== Syncing scripts to slave ==="
-rsync -a $WORKSPACE/*.py $WORKSPACE/input-text.md $WORKER_SSH:$WORKSPACE/
+rsync -a $WORKSPACE/*.py $WORKSPACE/*.md $WORKER_SSH:$WORKSPACE/
 
 echo "=== Stopping old containers ==="
 docker rm -f $CONTAINER_HEAD 2>/dev/null || true
@@ -51,6 +51,7 @@ ssh $WORKER_SSH "docker run -d --gpus all \
   -e RANK=1 \
   -e LOCAL_RANK=0 \
   -e PYTHONUNBUFFERED=1 \
+  -e SPARSE_ATTN_CHUNK=${SPARSE_ATTN_CHUNK:-512} \
   $NCCL_ENVS \
   $IMAGE \
   python3 /workspace/$RUN_SCRIPT"
@@ -69,6 +70,7 @@ docker run --rm --gpus all \
   -e RANK=0 \
   -e LOCAL_RANK=0 \
   -e PYTHONUNBUFFERED=1 \
+  -e SPARSE_ATTN_CHUNK=${SPARSE_ATTN_CHUNK:-512} \
   $NCCL_ENVS \
   $IMAGE \
   python3 /workspace/$RUN_SCRIPT
