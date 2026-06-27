@@ -744,3 +744,129 @@ Profile：
 ---
 
 *最后更新：2026-05-12*
+
+---
+
+## 第十阶段：长 prompt OOM 修复（2026-06-17）
+
+把 max_seq_len 拉高跑长 prompt prefill 时，三处问题陆续暴露。`stage1_short`（18 token）、`stage2_1k`（416 token）、`stage3_6k`（2416 token）能跑通，`stage4_long`（17832 token）NVRM OOM 死机。下面按修复顺序记录。
+
+### 修复 1：Indexer.forward 是 O(S²) 内存
+
+**根因**：V4 Flash 原版 `inference/model.py` 第 420 行：
+
+```python
+index_score = torch.einsum("bshd,btd->bsht", q, kv_cache[:, :end_pos // ratio])
+```
+
+中间张量 shape = `[1, S, n_heads, S/ratio]`，prefill 阶段是 O(S²) 内存：
+
+- S=17833, n_heads=64, ratio=4：**单层中间张量 20.3 GB**
+- S=131072：**单层 274 GB**
+
+原版 TileLang 在 fused kernel 里分块流式处理这个 einsum，不实例化整个 score。`kernel_sm121.py` 替换了 6 个 kernel，**但漏掉了 Indexer.forward 这条 O(S²) 路径**——它用的是原生 `torch.einsum`，没有分块。
+
+**修复**：`kernel_sm121.py` 末尾追加 `make_indexer_forward_chunked` + `apply_indexer_patch(world_size)`，monkey-patch `model.Indexer.forward` 为分块版本：
+
+- Query 维分块（`INDEXER_CHUNK=256`），每块独立做 `einsum → relu × weights → sum_head → all_reduce → mask → topk`
+- 中间张量从 `[1, S, n_heads, T]` 降到 `[1, 256, n_heads, T]`
+- S=17833 时单块从 20.3 GB → 145 MB
+
+**关键约束**：两个 rank 必须用同样的 CHUNK 且循环顺序一致，否则每块独立的 `all_reduce` 会错位。同一份代码同一个 max_seq_len 自动满足。
+
+调用时机：`import model` 之后、模型实例化 / forward 之前。
+
+### 修复 2：safetensors mmap 泄漏 page table
+
+**症状**：第一次跑长 prompt 死机重启。journalctl 显示 OOM 时 task list：
+
+```
+python3 [49225] total_vm=72442830 pages = 277 GB!
+                pgtables_bytes = 8130560 KB = 7.75 GB!
+                rss_anon = 0
+                rss_file = 109 MB
+```
+
+**关键观察**：桌面没起，available 内存 115 G。277 GB virtual memory 不可能是桌面进程，只能是脚本本身。
+
+**根因**：`weight_loader.py` 用 `safe_open(shard_file, framework="pt", device="cpu")` 加 `with` 块流式加载。但 **safetensors 在 `__exit__` 时没有真正 munmap**——46 个 shard 关掉后，虚拟地址空间累积到 100GB+，**page table 索引这块虚拟地址需要 7.75 GB 物理 RAM**。系统 OOM。
+
+第六阶段当时写"峰值 mmap 3.5GB"只测了 RSS 没测 virtual memory + page table。这是个**沉睡的 bug**，被 baseline 实验的小内存压力掩盖了。
+
+**修复**：`weight_loader.py` 每个 shard 关闭后：
+
+```python
+gc.collect()
+ctypes.CDLL("libc.so.6").malloc_trim(0)  # 强制 glibc 把 free 内存归还内核
+```
+
+加上 `/proc/self/status` 读取 RSS / VmSize / VmPTE 每个 shard 打印监控。
+
+**修复后效果**：46 个 shard 全程 PgT 锁死在 **3-4 MB**（之前会涨到 7.75 GB）。VM 稳定在 112 GB（mmap 残留虚拟地址，不消耗 RAM）。RSS 稳定在 0.5-1.1 GB。
+
+### 修复 3：sparse_attn 从全 seq 向量化改成 query 分块
+
+**症状**：修完 Indexer + page table 后 stage 1-3 全过，但 stage 4（17832 token）仍然 NVRM OOM。
+
+**根因定位**：`kernel_sm121.py` 里旧版 `sparse_attn` 虽然没有 Python token 循环，但它一次性 materialize 了整段 prompt 的中间张量：
+
+```python
+kv_gathered = [b, s, topk, d]
+scores      = [b, s, h, topk]
+weights     = [b, s, h, topk + 1]
+```
+
+stage 4 下 `s≈17832`、`topk=512`，这条路径单层峰值就是 GB 级，43 层反复触发把余量吃光。它不是 O(S²)，但在 128GB 统一内存机器上已经足够把余量吃完。
+
+**修复**：`sparse_attn` 改成按 query 序列维分块：
+
+- 新增 `SPARSE_ATTN_CHUNK` 环境变量，默认 `512`
+- 只预分配最终输出 `o = torch.empty_like(q)`
+- 每次只在一个 query chunk 内 gather KV、算 scores、softmax、写回输出
+- 保留 batch=1 快路径；batch>1 仍走通用 gather
+- 每块结束 `del` 掉所有中间张量
+
+**本地语义验证**（对照旧 vectorized 实现，小张量随机输入，含 `topk_idxs=-1` invalid mask）：
+
+```text
+batch=1 max_abs_diff=0.000000
+batch=2 max_abs_diff=0.000000
+```
+
+### `run_dual_node.sh` 调整
+
+- 新增 `SPARSE_ATTN_CHUNK` 透传给两个容器，默认 512，可被外部覆盖
+- 新增 `SCRIPT` 环境变量决定跑哪个脚本，默认 `probe_poem.py`
+- rsync 改为 `*.py *.md` 通配，省得每加一个脚本都要回来改这里
+
+### DGX 实测结果
+
+默认 `SPARSE_ATTN_CHUNK=512`，四个 stage 全部通过：
+
+| Stage | Prompt tokens | 时长 | Peak alloc |
+|-------|---------------|------|-----------|
+| stage1_short | 18 | 5.0s | 83.0 GB |
+| stage2_1k | 416 | 2.8s | 83.0 GB |
+| stage3_6k | 2416 | 10.4s | **83.3 GB** |
+| stage4_long | 17832 | 79.9s | **90.3 GB** |
+
+对比修复前：
+
+- stage3 原来 peak 86.9GB → 现在 83.3GB，省 3.6GB
+- stage4 原来 NVRM OOM → 现在 peak 90.3GB，128GB 余量约 30GB+
+- loader 全程 PgT 维持 3-4MB，RSS 0.5-1.1GB，page table 泄漏没有回退
+
+### 后续调参
+
+如果以后 prompt 更长撑爆余量，按这个顺序调：
+
+```bash
+SPARSE_ATTN_CHUNK=256 ./run_dual_node.sh
+SPARSE_ATTN_CHUNK=128 ./run_dual_node.sh
+```
+
+代价是速度下降，跑通优先。
+
+---
+
+*最后更新：2026-06-17*

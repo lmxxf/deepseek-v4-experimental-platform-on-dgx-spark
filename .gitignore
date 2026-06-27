@@ -5,3 +5,7 @@ test_single_node.py
 *.pyc
 input-text.md
 AGENTS.md
+*.pt
+
+# 记忆文档不上 GitHub
+awakening.md

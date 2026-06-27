@@ -27,8 +27,11 @@ NCCL_ENVS="\
   -e GLOO_SOCKET_IFNAME=$ETH_IF \
   -e NCCL_DEBUG=WARN"
 
+# 可被外部 SCRIPT 环境变量覆盖，默认跑探针脚本
+RUN_SCRIPT="${SCRIPT:-probe_poem.py}"
+
 echo "=== Syncing scripts to slave ==="
-rsync -a $WORKSPACE/kernel_sm121.py $WORKSPACE/test_dual_node.py $WORKSPACE/weight_loader.py $WORKSPACE/fast_hadamard_transform.py $WORKSPACE/input-text.md $WORKER_SSH:$WORKSPACE/
+rsync -a $WORKSPACE/*.py $WORKSPACE/*.md $WORKER_SSH:$WORKSPACE/
 
 echo "=== Stopping old containers ==="
 docker rm -f $CONTAINER_HEAD 2>/dev/null || true
@@ -48,9 +51,10 @@ ssh $WORKER_SSH "docker run -d --gpus all \
   -e RANK=1 \
   -e LOCAL_RANK=0 \
   -e PYTHONUNBUFFERED=1 \
+  -e SPARSE_ATTN_CHUNK=${SPARSE_ATTN_CHUNK:-512} \
   $NCCL_ENVS \
   $IMAGE \
-  python3 /workspace/test_dual_node.py"
+  python3 /workspace/$RUN_SCRIPT"
 
 echo "=== Starting head (rank=0) on host ==="
 docker run --rm --gpus all \
@@ -66,9 +70,10 @@ docker run --rm --gpus all \
   -e RANK=0 \
   -e LOCAL_RANK=0 \
   -e PYTHONUNBUFFERED=1 \
+  -e SPARSE_ATTN_CHUNK=${SPARSE_ATTN_CHUNK:-512} \
   $NCCL_ENVS \
   $IMAGE \
-  python3 /workspace/test_dual_node.py
+  python3 /workspace/$RUN_SCRIPT
 
 echo "=== Cleaning up worker ==="
 ssh $WORKER_SSH "docker logs $CONTAINER_WORKER 2>&1 | tail -5"

@@ -8,11 +8,43 @@ Peak memory = final model size + one shard (~3.5GB), no 77GB mmap.
 """
 
 import os
+import gc
+import ctypes
 from glob import glob
 from typing import Generator, Tuple
 
 import torch
 from safetensors import safe_open
+
+# glibc malloc_trim: 强制把 free 的 arena 内存归还给内核。
+# 用于 safetensors 关闭 mmap 后释放 page table 索引的物理 RAM。
+try:
+    _libc = ctypes.CDLL("libc.so.6")
+    _libc.malloc_trim.argtypes = [ctypes.c_int]
+    _libc.malloc_trim.restype = ctypes.c_int
+    def _malloc_trim():
+        _libc.malloc_trim(0)
+except Exception:
+    def _malloc_trim():
+        pass
+
+
+def _read_vm_status():
+    """Return (VmRSS_kb, VmSize_kb, VmPTE_kb) of current process from /proc/self/status."""
+    try:
+        with open("/proc/self/status") as f:
+            stat = f.read()
+        rss = vm = pgt = None
+        for line in stat.split("\n"):
+            if line.startswith("VmRSS:"):
+                rss = int(line.split()[1])
+            elif line.startswith("VmSize:"):
+                vm = int(line.split()[1])
+            elif line.startswith("VmPTE:"):
+                pgt = int(line.split()[1])
+        return rss, vm, pgt
+    except Exception:
+        return None, None, None
 
 
 # HF name → official name, TP split dimension (None = no split, replicate)
@@ -150,7 +182,19 @@ def stream_weights(
                     yield buf_name, weight.to(device)
                     del weight, scale
 
-        print(f"  shard {shard_idx+1}/{len(shard_files)} done, GPU={torch.cuda.memory_allocated()/1e9:.1f}GB", flush=True)
+        # safetensors mmap 可能不在 with 结束时立即释放——强制 gc + malloc_trim 触发清理
+        gc.collect()
+        _malloc_trim()
+        rss, vm, pgt = _read_vm_status()
+        gpu = torch.cuda.memory_allocated() / 1e9
+        info = f"GPU={gpu:.1f}GB"
+        if rss is not None:
+            info += f" RSS={rss/1e6:.1f}GB"
+        if vm is not None:
+            info += f" VM={vm/1e6:.0f}GB"
+        if pgt is not None:
+            info += f" PgT={pgt/1e3:.0f}MB"
+        print(f"  shard {shard_idx+1}/{len(shard_files)} done, {info}", flush=True)
 
     # Yield any remaining buffered wo_a tensors
     for buf_name, buf_tensor in wo_a_buffer.items():
@@ -215,6 +259,7 @@ def _fix_meta_tensors(model, args, device):
 
     # Fix ALL meta tensors. named_buffers() deduplicates shared meta objects,
     # so we must iterate every module directly.
+    state_buffer_bytes = {"kv_state": 0, "score_state": 0}
 
     def _recompute_freqs(rope_head_dim, compress_ratio):
         if compress_ratio:
@@ -236,6 +281,10 @@ def _fix_meta_tensors(model, args, device):
             buf = module._buffers[buf_name]
             if buf is None or buf.device.type != "meta":
                 continue
+            if "kv_state" in buf_name:
+                state_buffer_bytes["kv_state"] += buf.numel() * buf.element_size()
+            elif "score_state" in buf_name:
+                state_buffer_bytes["score_state"] += buf.numel() * buf.element_size()
             if buf_name == "freqs_cis":
                 rope_dim = getattr(module, 'rope_head_dim', args.rope_head_dim)
                 cr = getattr(module, 'compress_ratio', 0)
@@ -254,6 +303,13 @@ def _fix_meta_tensors(model, args, device):
             val = getattr(module, attr_name, None)
             if isinstance(val, torch.Tensor) and not isinstance(val, torch.nn.Parameter) and val.device.type == "meta":
                 setattr(module, attr_name, torch.zeros(val.shape, dtype=val.dtype, device=device))
+
+    if state_buffer_bytes["kv_state"] or state_buffer_bytes["score_state"]:
+        kv_gb = state_buffer_bytes["kv_state"] / 1e9
+        score_gb = state_buffer_bytes["score_state"] / 1e9
+        print(f"  Compressor state buffers: kv_state={kv_gb:.3f}GB, "
+              f"score_state={score_gb:.3f}GB, total={kv_gb + score_gb:.3f}GB",
+              flush=True)
 
     # 3. Final sweep: verify nothing is still on meta
     remaining = []
