@@ -772,7 +772,7 @@ index_score = torch.einsum("bshd,btd->bsht", q, kv_cache[:, :end_pos // ratio])
 中间张量 shape = `[1, S, n_heads, S/ratio]`，prefill 阶段是 O(S²) 内存：
 
 - S=17833, n_heads=64, ratio=4：**单层中间张量 20.3 GB**
-- S=131072：**单层 274 GB**
+- S=65536：**单层 274 GB**（S=131072 则约 1099 GB）
 
 原版 TileLang 在 fused kernel 里分块流式处理这个 einsum，不实例化整个 score。`kernel_sm121.py` 替换了 6 个 kernel，**但漏掉了 Indexer.forward 这条 O(S²) 路径**——它用的是原生 `torch.einsum`，没有分块。
 

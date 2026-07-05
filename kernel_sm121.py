@@ -539,7 +539,7 @@ def hc_split_sinkhorn(
 #     index_score = torch.einsum("bshd,btd->bsht", q, kv_cache[:, :T])
 #
 # 在 prefill 阶段 seqlen = S 时实例化 [1, S, n_heads, T] 张量，T = S/ratio。
-# S=17833, n_heads=64, ratio=4: 中间张量 ~20 GB；S=131072: 单层就 274 GB。
+# S=17833, n_heads=64, ratio=4: 中间张量 ~20 GB；S=65536: 单层就 274 GB（S=131072 则约 1099 GB）。
 #
 # 原版 TileLang 在 fused kernel 里分块流式处理，不实例化整个 score。
 # 我们没有 TileLang fallback，必须在 PyTorch 层把 seqlen 维分块。
