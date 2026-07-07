@@ -492,10 +492,13 @@ def sparse_attn(
 
 def hc_split_sinkhorn(
     mixes: torch.Tensor, hc_scale: torch.Tensor, hc_base: torch.Tensor,
-    hc_mult: int = 4, sinkhorn_iters: int = 7, eps: float = 1e-6,
+    hc_mult: int = 4, sinkhorn_iters: int = 20, eps: float = 1e-6,
 ):
+    # 官方 inference/kernel.py 用的是 20 步。之前这里 min(sinkhorn_iters, 5)
+    # 是为了"省算力"，但算过账后（每次 Sinkhorn 迭代 4×4 只需几十次浮点运算，
+    # 相对于每 token W_mix 那次 4096→24 的十万次投影是噪声），这个改动的
+    # 好处基本为零、代价是守恒律松了一档，2026-07-08 回归官方保守值 20 步。
     _t0 = _time.perf_counter()
-    sinkhorn_iters = min(sinkhorn_iters, 5)
     b, s, _ = mixes.shape
     hc = hc_mult
     mix_hc = (2 + hc) * hc
